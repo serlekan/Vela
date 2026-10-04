@@ -128,7 +128,7 @@ Because Hyperliquid coins are bare, a bare `BTC` won't collide with Binance's `B
 
 ## The bundled WEEX provider
 
-`@luxalgo/vela/providers/weex` is a from-scratch [WEEX](https://www.weex.com) provider (no third-party SDK, no API key). It serves USDT-margined perpetual contracts — `BTCUSDT.P`, `SOLUSDT.P`, … (the `.P` is optional, WEEX lists perpetuals only) — paginates past WEEX's 100-candle page size, and aggregates timeframes WEEX doesn't serve natively (e.g. `3`, `45`, `120`, `360`). WEEX answers browser requests with an open CORS policy, so it works from a page with no proxy. Live updates come from the standard polling of `getBars` (no streaming).
+`@luxalgo/vela/providers/weex` is a from-scratch [WEEX](https://www.weex.com) provider (no third-party SDK, no API key). It serves USDT-margined perpetual contracts — `BTCUSDT.P`, `SOLUSDT.P`, … (the `.P` is optional, WEEX lists perpetuals only) — reads the newest candles (the forming one included) in one request and pages older history past WEEX's 100-candle page size, and aggregates timeframes WEEX doesn't serve natively (e.g. `3`, `45`, `120`, `360`). WEEX answers browser requests with an open CORS policy, so it works from a page with no proxy. Live updates come from the standard polling of `getBars` (no streaming).
 
 ```js
 import { WeexProvider } from '@luxalgo/vela/providers/weex';

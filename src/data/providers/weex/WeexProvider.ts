@@ -6,6 +6,8 @@ import { baseOf, ledgerCryptoIconUrl } from '../../symbol-base';
 const BASE_URL = 'https://api-contract.weex.com/capi/v2/market';
 /** The history endpoint answers at most this many candles per call. */
 const PAGE = 100;
+/** The latest-candles endpoint answers at most this many candles. */
+const LATEST_MAX = 1000;
 /** Windows fetched in parallel while walking a range. */
 const CONCURRENCY = 4;
 /**
@@ -141,7 +143,8 @@ export function windowsNewestFirst(start: number, end: number, intervalMs: numbe
 /**
  * WEEX market-data provider, built from scratch on the public contract API — no
  * third-party SDK, no API key. Serves USDT-margined perpetual contracts (`BTCUSDT.P`,
- * `SOLUSDT.P`, …), paginates past the 100-candle page size, and aggregates timeframes
+ * `SOLUSDT.P`, …): the newest candles (forming one included) from `/candles`, older ones
+ * from 100-candle `/historyCandles` pages, and it aggregates timeframes
  * WEEX doesn't serve natively (e.g. `3`, `45`, `120`). WEEX answers browser requests
  * with an open CORS policy, so no proxy is needed. Live ticks come from the feed's
  * standard polling (there is no `subscribe`).
@@ -229,42 +232,70 @@ export class WeexProvider implements DataProvider {
     // ── internals ────────────────────────────────────────────────────────
 
     /**
-     * Fetch candles for a time window. The history endpoint takes a `[startTime, endTime]`
-     * window and caps each answer at 100 candles, so a range is split into page windows
-     * and walked newest-first, a few in parallel. A bar `limit` without `from` becomes a
-     * start offset; a `from` range (the cache's tail refresh) is used directly. The newest
-     * candle is the forming one.
+     * Fetch candles for a time window. WEEX splits this across two endpoints:
+     * - `/candles` serves the newest candles (up to 1000), the forming one included, and
+     *   ignores time windows;
+     * - `/historyCandles` serves CLOSED candles only, at most 100 per call, inside a
+     *   `[startTime, endTime]` window, and rejects an `endTime` in the future.
+     * So the recent part of a range comes from one `/candles` call, and history pages
+     * (walked newest-first, a few in parallel) only cover what lies before its oldest
+     * candle. A bar `limit` without `from` becomes a start offset; a `from` range (the
+     * cache's tail refresh) is used directly. The newest candle is the forming one.
      */
     private async fetchCandles(contract: string, granularity: string, intervalMs: number, range: BarRange): Promise<OHLCV[]> {
         const now = Date.now();
-        // One interval past `to` so the window includes the candle that opens at `to`.
-        const end = Math.min(range.to ?? now, now) + intervalMs;
-        const start = range.from != null ? range.from : end - ((range.limit ?? 500) + 1) * intervalMs;
-        const windows = windowsNewestFirst(start, end, intervalMs);
-
+        const top = Math.min(range.to ?? now, now);
+        // One interval of slack so a count-bounded request always reaches `limit` bars (sliced below).
+        const start = range.from != null ? range.from : top - (range.limit ?? 500) * intervalMs;
         const collected: OHLCV[] = [];
-        let empty = 0;
-        for (let i = 0; i < windows.length && empty < EMPTY_WINDOWS_TO_STOP; i += CONCURRENCY) {
-            const batch = windows.slice(i, i + CONCURRENCY);
-            const pages = await Promise.all(batch.map(([s, e]) => this.history(contract, granularity, s, e)));
-            for (const page of pages) {
-                empty = page.length === 0 ? empty + 1 : 0;
-                for (const b of page) if (b.time >= start && b.time < end) collected.push(b);
-                if (empty >= EMPTY_WINDOWS_TO_STOP) break;
+
+        // History must cover [start, historyEnd); the recent part shrinks it.
+        let historyEnd = top + intervalMs;
+        if (now - top < LATEST_MAX * intervalMs) {
+            const need = Math.ceil((now - start) / intervalMs) + 2;
+            const recent = await this.latest(contract, granularity, Math.min(LATEST_MAX, Math.max(2, need)));
+            collected.push(...recent);
+            if (recent.length > 0) historyEnd = Math.min(historyEnd, recent[0]!.time);
+        }
+
+        if (start < historyEnd) {
+            const windows = windowsNewestFirst(start, historyEnd, intervalMs);
+            let empty = 0;
+            for (let i = 0; i < windows.length && empty < EMPTY_WINDOWS_TO_STOP; i += CONCURRENCY) {
+                const batch = windows.slice(i, i + CONCURRENCY);
+                const pages = await Promise.all(batch.map(([s, e]) => this.history(contract, granularity, s, e - 1)));
+                for (const page of pages) {
+                    empty = page.length === 0 ? empty + 1 : 0;
+                    collected.push(...page);
+                    if (empty >= EMPTY_WINDOWS_TO_STOP) break;
+                }
             }
         }
-        const bars = dedupeSorted(collected);
+
+        const bars = dedupeSorted(collected.filter((b) => b.time >= start && b.time <= top));
         // Count-bounded (no explicit `from`): keep the most-recent `limit` bars.
         if (range.from == null && range.limit != null && bars.length > range.limit) return bars.slice(-range.limit);
         return bars;
     }
 
+    /** The newest `limit` candles, the forming one included (sorted ascending). */
+    private async latest(contract: string, granularity: string, limit: number): Promise<OHLCV[]> {
+        const qs = new URLSearchParams({ symbol: contract, granularity, limit: String(limit) });
+        const url = `${BASE_URL}/candles?${qs.toString()}`;
+        const data = await this.json(url).catch(() => new Promise((r) => setTimeout(r, RETRY_MS)).then(() => this.json(url)));
+        const rows = Array.isArray(data) ? data : ((data as { data?: unknown })?.data ?? []);
+        return Array.isArray(rows) ? dedupeSorted(candlesToOHLCV(rows as RawCandle[])) : [];
+    }
+
+    /** One history page: closed candles opening in `[startTime, endTime]`, `endTime` kept in the past. */
     private async history(contract: string, granularity: string, startTime: number, endTime: number): Promise<OHLCV[]> {
+        const end = Math.min(endTime, Date.now() - 1_000);
+        if (end <= startTime) return [];
         const qs = new URLSearchParams({
             symbol: contract,
             granularity,
             startTime: String(Math.floor(startTime)),
-            endTime: String(Math.floor(endTime)),
+            endTime: String(Math.floor(end)),
             limit: String(PAGE),
         });
         const url = `${BASE_URL}/historyCandles?${qs.toString()}`;

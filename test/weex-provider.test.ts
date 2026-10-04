@@ -58,9 +58,11 @@ describe('WEEX pure helpers', () => {
 });
 
 /**
- * Stub `fetch` with a fake WEEX: `series` maps granularity → ascending rows; the history
- * endpoint answers each `[startTime, endTime]` window like the live API (≤ 100 rows,
- * newest first, unsorted order is allowed).
+ * Stub `fetch` with a fake WEEX that keeps the live API's rules: `series` maps
+ * granularity → ascending rows, the LAST row being the forming candle.
+ * - `/candles` answers the newest `limit` rows (≤ 1000), forming candle included, in no order.
+ * - `/historyCandles` answers CLOSED rows only (≤ 100, newest first) in `[startTime, endTime]`,
+ *   and rejects an `endTime` in the future with WEEX's 40020 error.
  */
 function stubWeex(series: Record<string, string[][]>, contracts: unknown[] = []): URL[] {
     const calls: URL[] = [];
@@ -70,10 +72,21 @@ function stubWeex(series: Record<string, string[][]>, contracts: unknown[] = [])
             const url = new URL(String(input));
             calls.push(url);
             if (url.pathname.endsWith('/contracts')) return Promise.resolve(res(true, contracts));
-            const g = url.searchParams.get('granularity') ?? '';
+            const all = series[url.searchParams.get('granularity') ?? ''] ?? [];
+            if (url.pathname.endsWith('/candles')) {
+                const latest = all.slice(-Math.min(1000, Number(url.searchParams.get('limit') ?? 100)));
+                return Promise.resolve(
+                    res(
+                        true,
+                        [...latest].sort(() => 0.5 - Math.random()),
+                    ),
+                );
+            }
             const s = Number(url.searchParams.get('startTime'));
             const e = Number(url.searchParams.get('endTime'));
-            const rows = (series[g] ?? [])
+            if (e > Date.now()) return Promise.resolve(res(false, { code: '40020', msg: 'endTime error', data: null }, 400));
+            const rows = all
+                .slice(0, -1)
                 .filter((r) => Number(r[0]) >= s && Number(r[0]) <= e)
                 .slice(-100)
                 .reverse();
@@ -89,39 +102,66 @@ describe('WeexProvider.getBars (stubbed fetch)', () => {
         vi.useRealTimers();
     });
 
-    it('pages past the 100-candle cap and returns sorted, de-duplicated bars', async () => {
-        vi.useFakeTimers({ now: 400 * HOUR, toFake: ['Date'] });
-        const rows = Array.from({ length: 400 }, (_, i) => row(i * HOUR, '1', '2', '0.5', String(1 + i)));
+    it('takes the newest candles from /candles and older ones from history pages', async () => {
+        vi.useFakeTimers({ now: 2000 * HOUR + 30 * MIN, toFake: ['Date'] });
+        const rows = Array.from({ length: 2001 }, (_, i) => row(i * HOUR, '1', '2', '0.5', String(1 + i)));
         const calls = stubWeex({ '1h': rows });
-        const bars = await new WeexProvider().getBars('BTCUSDT.P', '60', { limit: 250 });
-        expect(bars).toHaveLength(250);
-        expect(bars[bars.length - 1]!.time).toBe(399 * HOUR); // the forming candle
-        expect(bars.every((b, i) => i === 0 || b.time > bars[i - 1]!.time)).toBe(true);
-        expect(calls.length).toBeGreaterThan(1); // more than one page was needed
+        const bars = await new WeexProvider().getBars('BTCUSDT.P', '60', { limit: 1500 });
+        expect(bars).toHaveLength(1500);
+        expect(bars[bars.length - 1]!.time).toBe(2000 * HOUR); // the forming candle (only /candles serves it)
+        expect(bars.every((b, i) => i === 0 || b.time - bars[i - 1]!.time === HOUR)).toBe(true); // no gaps
+        expect(calls.filter((u) => u.pathname.endsWith('/candles'))).toHaveLength(1);
+        expect(calls.filter((u) => u.pathname.endsWith('/historyCandles')).length).toBeGreaterThan(1);
         expect(calls[0]!.searchParams.get('symbol')).toBe('cmt_btcusdt');
         expect(calls[0]!.searchParams.get('granularity')).toBe('1h');
     });
 
+    it('never sends a history endTime in the future', async () => {
+        vi.useFakeTimers({ now: 300 * HOUR + 10 * MIN, toFake: ['Date'] });
+        const calls = stubWeex({ '1h': Array.from({ length: 301 }, (_, i) => row(i * HOUR)) });
+        await new WeexProvider().getBars('BTCUSDT.P', '60', { limit: 300 });
+        await new WeexProvider().getBars('BTCUSDT.P', '60', { to: 250 * HOUR, limit: 50 });
+        const history = calls.filter((u) => u.pathname.endsWith('/historyCandles'));
+        expect(history.every((u) => Number(u.searchParams.get('endTime')) <= Date.now())).toBe(true);
+    });
+
+    it('answers the live poll (limit 2) with the just-closed and the forming candle, in one request', async () => {
+        vi.useFakeTimers({ now: 50 * HOUR + 20 * MIN, toFake: ['Date'] });
+        const calls = stubWeex({ '1h': Array.from({ length: 51 }, (_, i) => row(i * HOUR)) });
+        const bars = await new WeexProvider().getBars('BTCUSDT.P', '60', { limit: 2 });
+        expect(bars.map((b) => b.time)).toEqual([49 * HOUR, 50 * HOUR]);
+        expect(calls).toHaveLength(1);
+    });
+
+    it('serves a past window from history pages alone', async () => {
+        vi.useFakeTimers({ now: 5000 * HOUR, toFake: ['Date'] });
+        const calls = stubWeex({ '1h': Array.from({ length: 5001 }, (_, i) => row(i * HOUR)) });
+        const bars = await new WeexProvider().getBars('BTCUSDT.P', '60', { to: 1000 * HOUR, limit: 150 });
+        expect(bars).toHaveLength(150);
+        expect(bars[bars.length - 1]!.time).toBe(1000 * HOUR);
+        expect(calls.some((u) => u.pathname.endsWith('/candles'))).toBe(false);
+    });
+
     it('stops walking back once windows come back empty (before the listing)', async () => {
         vi.useFakeTimers({ now: 1000 * HOUR, toFake: ['Date'] });
-        const rows = Array.from({ length: 150 }, (_, i) => row((850 + i) * HOUR)); // listed 150 hours ago
+        const rows = Array.from({ length: 151 }, (_, i) => row((850 + i) * HOUR)); // listed 150 hours ago
         const calls = stubWeex({ '1h': rows });
         const bars = await new WeexProvider().getBars('NEWUSDT.P', '60', { limit: 5000 });
-        expect(bars).toHaveLength(150);
+        expect(bars).toHaveLength(151);
         // 5000 bars would be 50 windows; the walk stops a few windows past genesis.
         expect(calls.length).toBeLessThan(12);
     });
 
     it('serves a from-bounded tail refresh, including the overlapping first bar', async () => {
         vi.useFakeTimers({ now: 100 * HOUR, toFake: ['Date'] });
-        const rows = Array.from({ length: 100 }, (_, i) => row(i * HOUR));
+        const rows = Array.from({ length: 101 }, (_, i) => row(i * HOUR));
         stubWeex({ '1h': rows });
         const bars = await new WeexProvider().getBars('BTCUSDT.P', '60', { from: 97 * HOUR });
-        expect(bars.map((b) => b.time)).toEqual([97 * HOUR, 98 * HOUR, 99 * HOUR]);
+        expect(bars.map((b) => b.time)).toEqual([97 * HOUR, 98 * HOUR, 99 * HOUR, 100 * HOUR]);
     });
 
     it('aggregates a timeframe WEEX does not serve natively (2h from 1h)', async () => {
-        vi.useFakeTimers({ now: 8 * HOUR, toFake: ['Date'] });
+        vi.useFakeTimers({ now: 7 * HOUR + 30 * MIN, toFake: ['Date'] });
         const rows = Array.from({ length: 8 }, (_, i) => row(i * HOUR, String(10 + i), String(20 + i), String(5 + i), String(11 + i)));
         stubWeex({ '1h': rows });
         const bars = await new WeexProvider().getBars('BTCUSDT.P', '120', { limit: 3 });
