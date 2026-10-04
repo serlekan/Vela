@@ -2,6 +2,17 @@
 
 All notable changes to Vela, newest first.
 
+## [Unreleased]
+
+### Added
+
+- **WEEX market data.** A new bundled provider, `WeexProvider`, charts WEEX USDT-margined
+  perpetual contracts (`WEEX:BTCUSDT.P`, `WEEX:SOLUSDT.P`, …) with no API key. It loads
+  deep history past WEEX's small page size, builds timeframes WEEX doesn't serve (such as
+  2 hours or 45 minutes) from smaller candles, lists every contract in the symbol search,
+  and works straight from a browser page. Import it from `@luxalgo/vela/providers/weex`;
+  the browser build exposes it as `Vela.WeexProvider`.
+
 ## [0.8.1]
 
 ### Changed

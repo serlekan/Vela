@@ -56,6 +56,11 @@
       "import": "./dist/providers/coinbase.js",
       "require": "./dist/providers/coinbase.cjs"
     },
+    "./providers/weex": {
+      "types": "./dist/providers/weex.d.ts",
+      "import": "./dist/providers/weex.js",
+      "require": "./dist/providers/weex.cjs"
+    },
     "./plugin": {
       "types": "./dist/plugin.d.ts",
       "import": "./dist/plugin.js",

@@ -126,6 +126,20 @@ chart.data.registerProvider('hyperliquid', new HyperliquidProvider());
 
 Because Hyperliquid coins are bare, a bare `BTC` won't collide with Binance's `BTCUSDT`; register both and each symbol routes to the venue that indexes it (or name one explicitly with a `BINANCE:` / `HYPERLIQUID:` prefix).
 
+## The bundled WEEX provider
+
+`@luxalgo/vela/providers/weex` is a from-scratch [WEEX](https://www.weex.com) provider (no third-party SDK, no API key). It serves USDT-margined perpetual contracts — `BTCUSDT.P`, `SOLUSDT.P`, … (the `.P` is optional, WEEX lists perpetuals only) — paginates past WEEX's 100-candle page size, and aggregates timeframes WEEX doesn't serve natively (e.g. `3`, `45`, `120`, `360`). WEEX answers browser requests with an open CORS policy, so it works from a page with no proxy. Live updates come from the standard polling of `getBars` (no streaming).
+
+```js
+import { WeexProvider } from '@luxalgo/vela/providers/weex';
+chart.data.registerProvider('weex', new WeexProvider());
+// new Vela('#chart', { symbol: 'WEEX:BTCUSDT.P', timeframe: '240' })
+```
+
+> WEEX pads the time before a contract listed with zero-price candles; the provider drops them, and a backward history walk stops at the listing instead of paging back further.
+
+Its tickers share the `BTCUSDT.P` spelling with Binance perpetuals, so register both and a bare ticker routes to whichever was registered first; name the venue with a `WEEX:` / `BINANCE:` prefix to pick one.
+
 ## Bringing your own provider
 
 Implement the `DataProvider` interface and register it under any name — see [Adding a data provider](../contributing/adding-a-data-provider.md). The only required method is `getBars`; everything else (`listSymbols`, `getSymbolInfo`, `info`, `subscribe`, `resolveSymbolIcon`) is a progressive enhancement. Symbol icons are the provider's call too: `resolveSymbolIcon(descriptor)` returns the icon URL the shells render in the symbol search, the status line and the object tree (the bundled crypto providers predefine a crypto-icon CDN; no resolver, or no URL, means a colored-initials badge — nothing breaks).
